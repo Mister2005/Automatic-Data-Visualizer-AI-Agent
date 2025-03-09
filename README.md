@@ -1,0 +1,1 @@
+I have created an AI Agent which will Visualize the data provided by the user on Streamlit. I have also added a fuction that implements some basic ML models on the data and gives full result for it. I Will try to make it more dynamic, add more functionalities in the future.
