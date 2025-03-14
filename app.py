@@ -4,7 +4,6 @@ import numpy as np
 import plotly.express as px
 import base64
 import io
-from io import StringIO
 from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder, LabelEncoder
 from sklearn.cluster import KMeans
@@ -17,6 +16,9 @@ from sklearn.svm import SVC, SVR
 from sklearn.neural_network import MLPRegressor, MLPClassifier
 from sklearn.manifold import TSNE
 import umap
+from sklearn.cluster import DBSCAN, AgglomerativeClustering, Birch, AffinityPropagation, MeanShift, OPTICS
+from sklearn.mixture import GaussianMixture
+from scipy.cluster.hierarchy import dendrogram
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     mean_squared_error, 
@@ -28,6 +30,10 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import os
 os.environ['STREAMLIT_WATCH_EXCLUDE_PATHS'] = 'torch._classes'
+
+# Disable torch warnings
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 
 # --- Helper Functions ---
 
@@ -74,23 +80,32 @@ def clean_data(df):
     df_cleaned = df_cleaned.dropna(how='all')
     return df_cleaned
 
+# Update the impute_data function
 def impute_data(df, strategy, knn_k=5):
-    """Impute missing values for numeric columns using the selected strategy."""
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    """Impute missing values using the selected strategy."""
     df_imputed = df.copy()
-    if len(numeric_cols) > 0:
-        if strategy == 'Mean':
-            imputer = SimpleImputer(strategy='mean')
-        elif strategy == 'Median':
-            imputer = SimpleImputer(strategy='median')
-        elif strategy == 'Most Frequent':
-            imputer = SimpleImputer(strategy='most_frequent')
-        elif strategy == 'KNN':
-            imputer = KNNImputer(n_neighbors=knn_k)
-        else:
-            st.error("Invalid imputation strategy!")
-            return df
-        df_imputed[numeric_cols] = imputer.fit_transform(df[numeric_cols])
+    
+    if strategy == 'Most Frequent':
+        # Handle both numeric and categorical columns
+        for col in df.columns:
+            if df[col].isnull().any():
+                mode_value = df[col].mode()[0]
+                df_imputed[col] = df[col].fillna(mode_value)
+    else:
+        # Handle numeric columns only
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            if strategy == 'Mean':
+                imputer = SimpleImputer(strategy='mean')
+            elif strategy == 'Median':
+                imputer = SimpleImputer(strategy='median')
+            elif strategy == 'KNN':
+                imputer = KNNImputer(n_neighbors=knn_k)
+            else:
+                st.error("Invalid imputation strategy!")
+                return df
+            df_imputed[numeric_cols] = imputer.fit_transform(df[numeric_cols])
+    
     return df_imputed
 
 def scale_data(df, method='Standard'):
@@ -146,155 +161,153 @@ def encode_categorical_data(df, method='OneHot'):
 
 def apply_model(df, model_type, target_column=None, n_clusters=3, n_components=2, **kwargs):
     """Apply selected model to the data."""
-    if target_column:
-        # Prepare data for supervised learning
-        X = df.drop(target_column, axis=1)
-        y = df[target_column]
-        X = X.select_dtypes(include=[np.number])
+    try:
+        if not isinstance(model_type, str):
+            raise ValueError(f"Model type must be a string, got {type(model_type)}")
         
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model_type = model_type.strip()  # Remove any whitespace
         
-        # Initialize result dictionary
-        results = {
-            'model': None,
-            'metrics': {},
-            'data': df,
-            'feature_importance': None
-        }
+        if target_column and target_column not in df.columns:
+            raise ValueError(f"Target column '{target_column}' not found in dataframe")
         
-        if model_type == "Linear Regression":
-            model = LinearRegression()
-            is_classifier = False
-        
-        elif model_type == "Logistic Regression":
-            model = LogisticRegression(random_state=42)
-            is_classifier = True
-        
-        elif model_type == "Decision Tree Regressor":
-            model = DecisionTreeRegressor(random_state=42)
-            is_classifier = False
-        
-        elif model_type == "Decision Tree Classifier":
-            model = DecisionTreeClassifier(random_state=42)
-            is_classifier = True
-        
-        elif model_type == "Naive Bayes":
-            model = GaussianNB()
-            is_classifier = True
-        
-        elif model_type == "SVM":
-            if len(np.unique(y)) > 2:  # Regression task
-                model = SVR(kernel='rbf')
-                is_classifier = False
-            else:  # Classification task
-                model = SVC(kernel='rbf', probability=True)
-                is_classifier = True
-        
-        elif model_type == "Neural Network":
-            if len(np.unique(y)) > 10:  # Regression task
-                model = MLPRegressor(
-                    hidden_layer_sizes=(100, 50),
-                    max_iter=1000,
-                    random_state=42
-                )
-                is_classifier = False
-            else:  # Classification task
-                model = MLPClassifier(
-                    hidden_layer_sizes=(100, 50),
-                    max_iter=1000,
-                    random_state=42
-                )
-                is_classifier = True
-        
-        # Fit model and get predictions
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        
-        # Calculate metrics
-        if is_classifier:
-            results['metrics']['accuracy'] = accuracy_score(y_test, y_pred)
-            results['metrics']['classification_report'] = classification_report(y_test, y_pred)
-        else:
-            results['metrics']['mse'] = mean_squared_error(y_test, y_pred)
-            results['metrics']['r2'] = r2_score(y_test, y_pred)
-        
-        # Get feature importance if available
-        if hasattr(model, 'feature_importances_'):
-            results['feature_importance'] = pd.DataFrame({
-                'Feature': X.columns,
-                'Importance': model.feature_importances_
-            }).sort_values('Importance', ascending=False)
-        
-        results['model'] = model
-        return results
-    
-    else:  # Unsupervised learning
-        numeric_df = df.select_dtypes(include=[np.number])
-        if numeric_df.shape[1] < 2:
-            st.error("Need at least 2 numeric columns")
-            return None
-        
-        results = {
-            'model': None,
-            'data': df.copy(),
-            'embeddings': None
-        }
-        
-        if model_type == "K-means Clustering":
-            model = KMeans(n_clusters=n_clusters, random_state=42)
-            clusters = model.fit_predict(numeric_df)
-            results['data']['Cluster'] = clusters
-            results['model'] = model
-        
-        elif model_type == "PCA":
-            model = PCA(n_components=n_components)
-            embeddings = model.fit_transform(numeric_df)
-            results['embeddings'] = embeddings
-            results['explained_variance'] = model.explained_variance_ratio_
-            results['model'] = model
+        if target_column:
+            # Prepare data for supervised learning
+            X = df.drop(target_column, axis=1)
+            y = df[target_column]
             
-            # Add PCA components to dataframe
-            pca_cols = [f'PC{i+1}' for i in range(n_components)]
-            results['data'] = pd.concat([
-                df,
-                pd.DataFrame(embeddings, columns=pca_cols, index=df.index)
-            ], axis=1)
-        
-        elif model_type == "t-SNE":
-            model = TSNE(
-                n_components=n_components,
-                perplexity=kwargs.get('perplexity', 30),
-                random_state=42
-            )
-            embeddings = model.fit_transform(numeric_df)
-            results['embeddings'] = embeddings
-            results['model'] = model
+            # Convert categorical columns
+            for col in X.select_dtypes(include=['object']):
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col])
             
-            # Add transformed columns
-            transformed_cols = [f'TSNE{i+1}' for i in range(n_components)]
-            results['data'] = pd.concat([
-                df,
-                pd.DataFrame(embeddings, columns=transformed_cols, index=df.index)
-            ], axis=1)
-        
-        elif model_type == "UMAP":
-            model = umap.UMAP(
-                n_components=n_components,
-                random_state=42
-            )
-            embeddings = model.fit_transform(numeric_df)
-            results['embeddings'] = embeddings
-            results['model'] = model
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             
-            # Add transformed columns
-            transformed_cols = [f'UMAP{i+1}' for i in range(n_components)]
-            results['data'] = pd.concat([
-                df,
-                pd.DataFrame(embeddings, columns=transformed_cols, index=df.index)
-            ], axis=1)
-        
-        return results
+            # Define available models based on target type
+            if isinstance(y[0], (int, float)) and len(np.unique(y)) > 10:
+                models = {
+                    "Linear Regression": LinearRegression(),
+                    "Random Forest": RandomForestRegressor(random_state=42),
+                    "Decision Tree": DecisionTreeRegressor(random_state=42),
+                    "Neural Network": MLPRegressor(random_state=42),
+                    "SVR": SVR()
+                }
+            else:
+                models = {
+                    "Logistic Regression": LogisticRegression(random_state=42),
+                    "Random Forest": RandomForestClassifier(random_state=42),
+                    "Decision Tree": DecisionTreeClassifier(random_state=42),
+                    "Neural Network": MLPClassifier(random_state=42),
+                    "SVC": SVC(probability=True, random_state=42)
+                }
+            
+            # Initialize model based on type
+            if model_type == "Linear Regression":
+                model = LinearRegression()
+            elif model_type == "Random Forest Regressor":
+                model = RandomForestRegressor(random_state=42)
+            elif model_type == "Decision Tree Regressor":
+                model = DecisionTreeRegressor(random_state=42)
+            elif model_type == "Neural Network Regressor":
+                model = MLPRegressor(random_state=42)
+            elif model_type == "SVR":
+                model = SVR()
+            elif model_type == "Logistic Regression":
+                model = LogisticRegression(random_state=42)
+            elif model_type == "Random Forest Classifier":
+                model = RandomForestClassifier(random_state=42)
+            elif model_type == "Decision Tree Classifier":
+                model = DecisionTreeClassifier(random_state=42)
+            elif model_type == "Neural Network Classifier":
+                model = MLPClassifier(random_state=42)
+            elif model_type == "SVC":
+                model = SVC(probability=True, random_state=42)
+            else:
+                raise ValueError(f"Unknown model type: {model_type}")
+            
+            # Train model
+            model.fit(X_train, y_train)
+            
+            # Make predictions
+            y_pred = model.predict(X_test)
+            
+            # Calculate metrics
+            results = {
+                'model': model,
+                'metrics': {},
+                'data': df,
+                'feature_importance': None,
+                'X_train': X_train,
+                'X_test': X_test,
+                'y_train': y_train,
+                'y_test': y_test
+            }
+            
+            if isinstance(model, (LinearRegression, DecisionTreeRegressor, 
+                                RandomForestRegressor, SVR, MLPRegressor)):
+                results['metrics']['mse'] = mean_squared_error(y_test, y_pred)
+                results['metrics']['r2'] = r2_score(y_test, y_pred)
+            else:
+                results['metrics']['accuracy'] = accuracy_score(y_test, y_pred)
+                results['metrics']['classification_report'] = classification_report(y_test, y_pred)
+            
+            # Get feature importance if available
+            if hasattr(model, 'feature_importances_'):
+                results['feature_importance'] = pd.DataFrame({
+                    'Feature': X.columns,
+                    'Importance': model.feature_importances_
+                }).sort_values('Importance', ascending=False)
+            
+            return results
+            
+        else:  # Unsupervised learning
+            if model_type == "K-means":
+                model = KMeans(n_clusters=n_clusters, random_state=42)
+                clusters = model.fit_predict(df.select_dtypes(include=[np.number]))
+                results = {
+                    'model': model,
+                    'data': df.assign(Cluster=clusters),
+                    'metrics': {
+                        'inertia': model.inertia_,
+                        'n_clusters': n_clusters
+                    }
+                }
+                return results
+            
+            elif model_type in ["PCA", "t-SNE", "UMAP"]:
+                numeric_data = df.select_dtypes(include=[np.number])
+                
+                if model_type == "PCA":
+                    model = PCA(n_components=n_components, random_state=42)
+                    embeddings = model.fit_transform(numeric_data)
+                    explained_var = model.explained_variance_ratio_
+                elif model_type == "t-SNE":
+                    model = TSNE(n_components=n_components, random_state=42)
+                    embeddings = model.fit_transform(numeric_data)
+                    explained_var = None
+                else:  # UMAP
+                    reducer = umap.UMAP(n_components=n_components, random_state=42)
+                    embeddings = reducer.fit_transform(numeric_data)
+                    explained_var = None
+                
+                # Create column names
+                dim_names = [f"{model_type}{i+1}" for i in range(n_components)]
+                reduced_df = pd.DataFrame(embeddings, columns=dim_names, index=df.index)
+                
+                results = {
+                    'model': model,
+                    'embeddings': embeddings,
+                    'explained_variance': explained_var,
+                    'data': reduced_df
+                }
+                return results
+            
+            else:
+                raise ValueError(f"Unknown model type: {model_type}")
+            
+    except Exception as e:
+        st.error(f"Error in model application: {str(e)}")
+        return None
 
 def create_scatter_plot(df, x_col, y_col, color_by=None, size_by=None, title=None):
     """Generate a 2D scatter plot using selected numeric columns."""
@@ -596,7 +609,9 @@ def create_heatmap(df, title=None):
 def download_link(object_to_download, download_filename, download_link_text):
     """Generate a download link for an object (DataFrame or string)."""
     if isinstance(object_to_download, pd.DataFrame):
-        object_to_download = object_to_download.to_csv(index=False)
+        # Convert DataFrame before creating CSV
+        df_to_download = convert_df_for_streamlit(object_to_download)
+        object_to_download = df_to_download.to_csv(index=False)
     b64 = base64.b64encode(object_to_download.encode()).decode()
     return f'<a href="data:file/txt;base64,{b64}" download="{download_filename}">{download_link_text}</a>'
 
@@ -608,6 +623,93 @@ def download_plotly_fig(fig, filename="plot.png"):
     b64 = base64.b64encode(buffer.read()).decode()
     href = f'<a href="data:image/png;base64,{b64}" download="{filename}">Download Image</a>'
     return href
+
+def make_prediction(model, input_data, feature_columns):
+    """Make predictions using the trained model."""
+    try:
+        # Convert input data to correct format
+        input_array = np.array([float(input_data[col]) for col in feature_columns]).reshape(1, -1)
+        
+        # Make prediction
+        prediction = model.predict(input_array)
+        
+        # Get prediction probability if available (for classifiers)
+        prob = None
+        if hasattr(model, 'predict_proba'):
+            prob = model.predict_proba(input_array)
+        
+        return prediction[0], prob[0] if prob is not None else None
+    except Exception as e:
+        st.error(f"Prediction error: {str(e)}")
+        return None, None
+
+def preprocess_input_data(input_df, handle_missing=False, missing_strategy=None,
+                         scale_features=False, scaler_type=None,
+                         encode_categorical=False, encoding_method=None):
+    """Preprocess input data for prediction."""
+    df_processed = input_df.copy()
+    
+    # Handle missing values
+    if handle_missing and missing_strategy:
+        imputer = SimpleImputer(strategy=missing_strategy.lower())
+        df_processed = pd.DataFrame(
+            imputer.fit_transform(df_processed),
+            columns=df_processed.columns
+        )
+    
+    # Scale features
+    if scale_features and scaler_type:
+        scaler = StandardScaler() if scaler_type == "Standard" else MinMaxScaler()
+        df_processed = pd.DataFrame(
+            scaler.fit_transform(df_processed),
+            columns=df_processed.columns
+        )
+    
+    # Encode categorical variables
+    if encode_categorical and encoding_method:
+        for col in df_processed.select_dtypes(include=['object']):
+            if encoding_method == "Label":
+                le = LabelEncoder()
+                df_processed[col] = le.fit_transform(df_processed[col])
+            elif encoding_method == "One-Hot":
+                encoder = OneHotEncoder(sparse_output=False, drop='first')
+                encoded = encoder.fit_transform(df_processed[[col]])
+                encoded_cols = [f"{col}_{i}" for i in range(encoded.shape[1])]
+                df_processed = pd.concat([
+                    df_processed.drop(col, axis=1),
+                    pd.DataFrame(encoded, columns=encoded_cols, index=df_processed.index)
+                ], axis=1)
+    
+    return df_processed
+
+# Add this helper function at the top of the file with other helper functions
+def convert_df_for_streamlit(df):
+    """Convert DataFrame to make it compatible with Streamlit's display functions."""
+    # Make a copy to avoid modifying the original DataFrame
+    df_converted = df.copy()
+    
+    # Convert object columns to string
+    for col in df_converted.select_dtypes(['object']).columns:
+        df_converted[col] = df_converted[col].astype(str)
+    
+    # Convert any problematic numeric types
+    for col in df_converted.select_dtypes(['float64', 'int64']).columns:
+        if df_converted[col].isnull().any():
+            df_converted[col] = df_converted[col].astype('float32')
+        else:
+            df_converted[col] = df_converted[col].astype('float32')
+            
+    return df_converted
+
+def safe_display_dataframe(df, container):
+    """Safely display DataFrame in Streamlit with error handling."""
+    try:
+        display_df = convert_df_for_streamlit(df)
+        container.dataframe(display_df)
+    except Exception as e:
+        container.error(f"Error displaying data: {str(e)}")
+        container.write("Showing raw data instead:")
+        container.write(df)
 
 # --- Custom Styles ---
 def set_custom_theme():
@@ -692,6 +794,22 @@ def set_custom_theme():
             background-color: rgba(229, 62, 62, 0.2);
             border-left: 5px solid #E53E3E;
         }
+        .prediction-container {
+            background-color: #1A2333;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+        .prediction-result {
+            font-size: 24px;
+            font-weight: bold;
+            color: #5663F7;
+            text-align: center;
+            padding: 20px;
+            background-color: rgba(86, 99, 247, 0.1);
+            border-radius: 10px;
+            margin-top: 10px;
+        }
     </style>
     """
     # Add Google fonts
@@ -707,6 +825,10 @@ def set_custom_theme():
 def main():
     st.set_page_config(page_title="Dynamic AI Data Visualization Agent", layout="wide")
     set_custom_theme()
+    
+    # Initialize the session state
+    if 'trained_models' not in st.session_state:
+        st.session_state.trained_models = {}
     
     # App header with custom styling
     st.markdown("<h1 style='text-align: center; color: #5663F7; margin-bottom: 0;'>Dynamic AI Data Visualization Agent</h1>", unsafe_allow_html=True)
@@ -746,21 +868,44 @@ def main():
                             help="Select how you want to fill missing values"
                         )
                         
+                        # Separate numeric and categorical columns
+                        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                        categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+                        
+                        # Show appropriate columns based on strategy
+                        if strategy in ["Mean", "Median", "KNN"]:
+                            cols_to_impute = st.multiselect(
+                                "Select numeric columns to impute",
+                                numeric_cols,
+                                default=numeric_cols,
+                                help="Only numeric columns can be imputed with Mean/Median/KNN"
+                            )
+                        else:  # Most Frequent strategy
+                            all_cols = numeric_cols + categorical_cols
+                            cols_to_impute = st.multiselect(
+                                "Select columns to impute",
+                                all_cols,
+                                default=all_cols,
+                                help="Both numeric and categorical columns can be imputed with Most Frequent strategy"
+                            )
+                        
                         if strategy == "KNN":
                             k = st.slider("Number of neighbors (k)", 1, 10, 5)
-                        
-                        numeric_cols = df.select_dtypes(include=[np.number]).columns
-                        cols_to_impute = st.multiselect(
-                            "Select columns to impute",
-                            numeric_cols,
-                            default=numeric_cols
-                        )
                         
                         if st.button("Apply Imputation"):
                             if cols_to_impute:
                                 with st.spinner(f"Imputing missing values using {strategy}..."):
-                                    df = impute_data(df, strategy, knn_k=k if strategy == "KNN" else None)
-                                    st.success("✅ Missing values filled successfully!")
+                                    if strategy == "Most Frequent":
+                                        # Handle both numeric and categorical columns
+                                        for col in cols_to_impute:
+                                            mode_value = df[col].mode()[0]
+                                            df[col] = df[col].fillna(mode_value)
+                                        st.success("✅ Missing values filled successfully!")
+                                    else:
+                                        # Only numeric columns for Mean/Median/KNN
+                                        df_numeric = df[cols_to_impute]
+                                        df = impute_data(df, strategy, knn_k=k if strategy == "KNN" else None)
+                                        st.success("✅ Missing values filled successfully!")
                             else:
                                 st.warning("Please select at least one column to impute")
 
@@ -817,7 +962,7 @@ def main():
                     if st.checkbox("Enable model application"):
                         model_category = st.selectbox(
                             "Select model type:",
-                            ["Dimensionality Reduction", "Clustering", "Regression", "Classification"],
+                            ["Dimensionality Reduction", "Clustering", "Regression", "Classification"],  # Removed "Data Prediction"
                             help="Choose the type of model to apply"
                         )
                         
@@ -846,55 +991,238 @@ def main():
                                     if results:
                                         show_dim_reduction_results(dim_model, results, n_components)
 
+                        # Update the clustering section in the model selection box
                         elif model_category == "Clustering":
                             cluster_model = st.selectbox(
                                 "Choose clustering method:",
-                                ["K-means"]
+                                ["K-means", "DBSCAN", "Gaussian Mixture", "BIRCH", 
+                                 "Affinity Propagation", "Mean-Shift", "OPTICS", 
+                                 "Agglomerative Clustering"]
                             )
                             
-                            n_clusters = st.slider("Number of clusters", 2, 10, 3)
+                            # Parameters for each clustering algorithm
+                            if cluster_model == "K-means":
+                                n_clusters = st.slider("Number of clusters", 2, 10, 3)
+                                params = {"n_clusters": n_clusters}
                             
+                            elif cluster_model == "DBSCAN":
+                                eps = st.slider("Epsilon (neighborhood distance)", 0.1, 2.0, 0.5)
+                                min_samples = st.slider("Minimum samples in neighborhood", 2, 10, 5)
+                                params = {"eps": eps, "min_samples": min_samples}
+                            
+                            elif cluster_model == "Gaussian Mixture":
+                                n_components = st.slider("Number of components", 2, 10, 3)
+                                covariance_type = st.selectbox("Covariance type", 
+                                                             ["full", "tied", "diag", "spherical"])
+                                params = {"n_components": n_components, 
+                                         "covariance_type": covariance_type}
+                            
+                            elif cluster_model == "BIRCH":
+                                n_clusters = st.slider("Number of clusters", 2, 10, 3)
+                                threshold = st.slider("Branching factor", 0.1, 2.0, 0.5)
+                                params = {"n_clusters": n_clusters, "threshold": threshold}
+                            
+                            elif cluster_model == "Affinity Propagation":
+                                damping = st.slider("Damping factor", 0.5, 1.0, 0.5, step=0.1)
+                                max_iter = st.slider("Maximum iterations", 100, 1000, 200)
+                                params = {"damping": damping, "max_iter": max_iter}
+                            
+                            elif cluster_model == "Mean-Shift":
+                                bandwidth = st.slider("Bandwidth", 0.1, 5.0, 2.0)
+                                params = {"bandwidth": bandwidth}
+                            
+                            elif cluster_model == "OPTICS":
+                                min_samples = st.slider("Minimum samples", 2, 10, 5)
+                                max_eps = st.slider("Maximum epsilon", 0.1, 5.0, 2.0)
+                                params = {"min_samples": min_samples, "max_eps": max_eps}
+                            
+                            elif cluster_model == "Agglomerative Clustering":
+                                n_clusters = st.slider("Number of clusters", 2, 10, 3)
+                                linkage = st.selectbox("Linkage criterion", 
+                                                     ["ward", "complete", "average", "single"])
+                                params = {"n_clusters": n_clusters, "linkage": linkage}
+
                             if st.button(f"Apply {cluster_model}"):
                                 with st.spinner(f"Applying {cluster_model}..."):
-                                    results = apply_model(df, "K-means Clustering", n_clusters=n_clusters)
-                                    if results:
-                                        show_clustering_results(results)
+                                    # Update the model creation based on selected algorithm
+                                    if cluster_model == "K-means":
+                                        model = KMeans(**params)
+                                    elif cluster_model == "DBSCAN":
+                                        model = DBSCAN(**params)
+                                    elif cluster_model == "Gaussian Mixture":
+                                        model = GaussianMixture(**params)
+                                    elif cluster_model == "BIRCH":
+                                        model = Birch(**params)
+                                    elif cluster_model == "Affinity Propagation":
+                                        model = AffinityPropagation(**params)
+                                    elif cluster_model == "Mean-Shift":
+                                        model = MeanShift(**params)
+                                    elif cluster_model == "OPTICS":
+                                        model = OPTICS(**params)
+                                    elif cluster_model == "Agglomerative Clustering":
+                                        model = AgglomerativeClustering(**params)
+
+                                    # Apply clustering
+                                    numeric_data = df.select_dtypes(include=[np.number])
+                                    clusters = model.fit_predict(numeric_data)
+                                    
+                                    results = {
+                                        'model': model,
+                                        'data': df.assign(Cluster=clusters),
+                                        'metrics': {
+                                            'n_clusters': len(np.unique(clusters)),
+                                            'params': params
+                                        }
+                                    }
+                                    
+                                    if hasattr(model, 'inertia_'):
+                                        results['metrics']['inertia'] = model.inertia_
+                                        
+                                    show_clustering_results(results, cluster_model)
 
                         elif model_category in ["Regression", "Classification"]:
+                            # Define available models
                             if model_category == "Regression":
+                                models = {
+                                    "Linear Regression": {
+                                        "model": LinearRegression(),
+                                        "params": {
+                                            "fit_intercept": [True, False],
+                                            "normalize": [True, False]
+                                        }
+                                    },
+                                    "Random Forest Regressor": {
+                                        "model": RandomForestRegressor(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 300),
+                                            "max_depth": (3, 30),
+                                            "min_samples_split": (2, 10),
+                                            "min_samples_leaf": (1, 4)
+                                        }
+                                    },
+                                    "Decision Tree Regressor": {
+                                        "model": DecisionTreeRegressor(random_state=42),
+                                        "params": {
+                                            "max_depth": (3, 30),
+                                            "min_samples_split": (2, 10),
+                                            "min_samples_leaf": (1, 4)
+                                        }
+                                    },
+                                    "Neural Network Regressor": {
+                                        "model": MLPRegressor(random_state=42),
+                                        "params": {
+                                            "hidden_layer_sizes": ["(50,)", "(100,)", "(100,50)", "(100,50,25)"],
+                                            "activation": ["relu", "tanh"],
+                                            "alpha": (0.0001, 0.01),
+                                            "learning_rate": ["constant", "adaptive"],
+                                            "max_iter": (500, 2000)
+                                        }
+                                    },
+                                    "SVR": {
+                                        "model": SVR(),
+                                        "params": {
+                                            "C": (0.1, 10.0),
+                                            "kernel": ["rbf", "linear"],
+                                            "epsilon": (0.01, 0.5)
+                                        }
+                                    }
+                                }
                                 target_col = st.selectbox(
                                     "Select target variable",
                                     df.select_dtypes(include=[np.number]).columns
                                 )
-                                models = ["Linear Regression", "Decision Tree", "Neural Network"]
-                            else:
+                            else:  # Classification
+                                models = {
+                                    "Logistic Regression": {
+                                        "model": LogisticRegression(random_state=42),
+                                        "params": {
+                                            "C": (0.001, 10.0),  # Wider range for regularization
+                                            "max_iter": (100, 1000),
+                                            "penalty": ["l1", "l2"]
+                                        }
+                                    },
+                                    "Random Forest Classifier": {
+                                        "model": RandomForestClassifier(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 300),
+                                            "max_depth": (3, 20),
+                                            "min_samples_split": (2, 10),
+                                            "min_samples_leaf": (1, 4)
+                                        }
+                                    },
+                                    "Neural Network Classifier": {
+                                        "model": MLPClassifier(random_state=42),
+                                        "params": {
+                                            "hidden_layer_sizes": ["50,25", "100,50", "100,50,25"],
+                                            "alpha": (0.0001, 0.01),
+                                            "learning_rate_init": (0.001, 0.1),
+                                            "max_iter": (200, 2000)
+                                        }
+                                    }
+                                }
                                 target_col = st.selectbox(
                                     "Select target variable",
-                                    df.select_dtypes(exclude=[np.number]).columns
+                                    df.columns
                                 )
-                                models = ["Logistic Regression", "Decision Tree", "Neural Network"]
                             
-                            selected_model = st.selectbox("Choose model:", models)
+                            model_name = st.selectbox(
+                                "Choose model:",
+                                list(models.keys())
+                            )
                             
+                            # Model hyperparameters
+                            st.markdown("##### Model Hyperparameters")
+                            if "Random Forest" in model_name:
+                                n_estimators = st.slider("Number of trees", 10, 200, 100)
+                                max_depth = st.slider("Maximum depth", 1, 50, 10)
+                                if "Regressor" in model_name:
+                                    models[model_name] = RandomForestRegressor(
+                                        n_estimators=n_estimators,
+                                        max_depth=max_depth,
+                                        random_state=42
+                                    )
+                                else:
+                                    models[model_name] = RandomForestClassifier(
+                                        n_estimators=n_estimators,
+                                        max_depth=max_depth,
+                                        random_state=42
+                                    )
+                            elif "Neural Network" in model_name:
+                                hidden_layers = st.text_input("Hidden layer sizes (comma-separated)", "100,50")
+                                max_iter = st.slider("Maximum iterations", 100, 2000, 1000)
+                                hidden_layer_sizes = tuple(map(int, hidden_layers.split(',')))
+                                if "Regressor" in model_name:
+                                    models[model_name] = MLPRegressor(
+                                        hidden_layer_sizes=hidden_layer_sizes,
+                                        max_iter=max_iter,
+                                        random_state=42
+                                    )
+                                else:
+                                    models[model_name] = MLPClassifier(
+                                        hidden_layer_sizes=hidden_layer_sizes,
+                                        max_iter=max_iter,
+                                        random_state=42
+                                    )
+
                             feature_cols = st.multiselect(
                                 "Select feature columns",
                                 [col for col in df.columns if col != target_col],
                                 default=[col for col in df.columns if col != target_col]
                             )
                             
-                            if st.button(f"Apply {selected_model}"):
+                            if st.button(f"Apply {model_name}"):
                                 if feature_cols:
-                                    with st.spinner(f"Applying {selected_model}..."):
+                                    with st.spinner(f"Applying {model_name}..."):
                                         results = apply_model(
                                             df[feature_cols + [target_col]], 
-                                            selected_model, 
+                                            model_name, 
                                             target_column=target_col
                                         )
                                         if results:
                                             if model_category == "Regression":
-                                                show_regression_results(selected_model, results)
+                                                show_regression_results(model_name, results)
                                             else:
-                                                show_classification_results(selected_model, results)
+                                                show_classification_results(model_name, results)
                                 else:
                                     st.warning("Please select at least one feature column")
 
@@ -904,8 +1232,10 @@ def main():
                     st.markdown(tmp_download_link, unsafe_allow_html=True)
             
             with col2:
-                tab1, tab2 = st.tabs(["📊 Visualization", "🔢 Data Preview"])
+                # Create tabs
+                tab1, tab2, tab3 = st.tabs(["📊 Visualization", "🔮 Predictions", "🔢 Data Preview"])
                 
+                # Visualization tab
                 with tab1:
                     st.markdown("### 📊 Data Visualization")
                     
@@ -1040,9 +1370,319 @@ def main():
                             except Exception as e:
                                 st.error(f"An error occurred while generating the visualization: {e}")
                 
+                # Predictions tab
                 with tab2:
+                    st.markdown("### 🔮 Machine Learning Predictions")
+                    
+                    # Create two columns for preprocessing and model
+                    pred_prep_col, pred_model_col = st.columns([1, 1])
+                    
+                    with pred_prep_col:
+                        st.markdown("#### Data Preprocessing")
+                        
+                        # Target Selection
+                        target_col = st.selectbox(
+                            "Select Target Variable",
+                            df.columns,
+                            help="Choose the variable you want to predict"
+                        )
+                        
+                        # Feature Selection
+                        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                        categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+                        
+                        feature_cols = st.multiselect(
+                            "Select Features",
+                            [col for col in df.columns if col != target_col],
+                            default=[col for col in numeric_cols if col != target_col],
+                            help="Choose the features to use for prediction"
+                        )
+                        
+                        if feature_cols:
+                            with st.expander("Preprocessing Options", expanded=True):
+                                # Handle Missing Values
+                                handle_missing = st.checkbox("Handle Missing Values")
+                                if handle_missing:
+                                    missing_strategy = st.selectbox(
+                                        "Missing Values Strategy",
+                                        ["Mean", "Median", "most_frequent"]
+                                    )
+                                
+                                # Feature Scaling
+                                scale_features = st.checkbox("Scale Features")
+                                if scale_features:
+                                    scaler_type = st.selectbox(
+                                        "Scaling Method",
+                                        ["Standard", "MinMax"]
+                                    )
+                                
+                                # Categorical Encoding
+                                if categorical_cols:
+                                    encode_categorical = st.checkbox("Encode Categorical Variables")
+                                    if encode_categorical:
+                                        encoding_method = st.selectbox(
+                                            "Encoding Method",
+                                            ["One-Hot", "Label"]
+                                        )
+                    
+                    with pred_model_col:
+                        st.markdown("#### Model Configuration")
+                        
+                        # Determine if regression or classification and set up models
+                        if df[target_col].dtype in ['int64', 'float64'] and df[target_col].nunique() > 10:
+                            task_type = "Regression"
+                            models = {
+                                "Linear Regression": {
+                                    "model": LinearRegression(),
+                                    "params": {
+                                        "fit_intercept": [True, False],
+                                        "normalize": [True, False]
+                                    }
+                                },
+                                "Random Forest Regressor": {
+                                    "model": RandomForestRegressor(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 300),
+                                        "max_depth": (3, 30),
+                                        "min_samples_split": (2, 10),
+                                        "min_samples_leaf": (1, 4)
+                                    }
+                                },
+                                "Decision Tree Regressor": {
+                                    "model": DecisionTreeRegressor(random_state=42),
+                                    "params": {
+                                        "max_depth": (3, 30),
+                                        "min_samples_split": (2, 10),
+                                        "min_samples_leaf": (1, 4)
+                                    }
+                                },
+                                "Neural Network Regressor": {
+                                    "model": MLPRegressor(random_state=42),
+                                    "params": {
+                                        "hidden_layer_sizes": ["(50,)", "(100,)", "(100,50)", "(100,50,25)"],
+                                        "activation": ["relu", "tanh"],
+                                        "alpha": (0.0001, 0.01),
+                                        "learning_rate": ["constant", "adaptive"],
+                                        "max_iter": (500, 2000)
+                                    }
+                                },
+                                "SVR": {
+                                    "model": SVR(),
+                                    "params": {
+                                        "C": (0.1, 10.0),
+                                        "kernel": ["rbf", "linear"],
+                                        "epsilon": (0.01, 0.5)
+                                    }
+                                }
+                            }
+                        else:
+                            task_type = "Classification"
+                            models = {
+                                "Logistic Regression": {
+                                    "model": LogisticRegression(random_state=42),
+                                    "params": {
+                                        "C": (0.001, 10.0),  # Wider range for regularization
+                                        "max_iter": (100, 1000),
+                                        "penalty": ["l1", "l2"]
+                                    }
+                                },
+                                "Random Forest Classifier": {
+                                    "model": RandomForestClassifier(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 300),
+                                        "max_depth": (3, 20),
+                                        "min_samples_split": (2, 10),
+                                        "min_samples_leaf": (1, 4)
+                                    }
+                                },
+                                "Neural Network Classifier": {
+                                    "model": MLPClassifier(random_state=42),
+                                    "params": {
+                                        "hidden_layer_sizes": ["50,25", "100,50", "100,50,25"],
+                                        "alpha": (0.0001, 0.01),
+                                        "learning_rate_init": (0.001, 0.1),
+                                        "max_iter": (200, 2000)
+                                    }
+                                }
+                            }
+                        
+                        st.markdown(f"Task Type: **{task_type}**")
+                        
+                        # Model Selection with Apply buttons for each model
+                        st.write("#### Select Models to Apply")
+                        
+                        selected_models = []
+                        for model_name, model_info in models.items():
+                            # Use expander instead of columns
+                            with st.expander(f"📊 {model_name}", expanded=False):
+                                if st.checkbox(f"Select {model_name}", key=f"select_{model_name}"):
+                                    selected_models.append(model_name)
+                                    st.markdown("##### Model Parameters")
+                                    params = {}
+                                    for param_name, param_range in model_info["params"].items():
+                                        if isinstance(param_range, tuple):
+                                            if isinstance(param_range[0], int):
+                                                params[param_name] = st.slider(
+                                                    f"{param_name}", 
+                                                    param_range[0], 
+                                                    param_range[1], 
+                                                    key=f"{model_name}_{param_name}"
+                                                )
+                                            else:
+                                                params[param_name] = st.slider(
+                                                    f"{param_name}", 
+                                                    float(param_range[0]), 
+                                                    float(param_range[1]),
+                                                    key=f"{model_name}_{param_name}"
+                                                )
+                                        elif isinstance(param_range, list):
+                                            params[param_name] = st.selectbox(
+                                                f"{param_name}",
+                                                param_range,
+                                                key=f"{model_name}_{param_name}"
+                                            )
+
+                        # Apply selected models
+                        if selected_models and st.button("Train Selected Models"):
+                            st.markdown("### 📊 Model Results Comparison")
+                            
+                            results_container = st.container()
+                            with results_container:
+                                all_results = {}
+                                for model_name in selected_models:
+                                    with st.spinner(f"Training {model_name}..."):
+                                        try:
+                                            # Get model and its parameters
+                                            model_info = models[model_name]
+                                            model = model_info["model"]
+                                            params = model_info.get("current_params", {})
+                                            
+                                            # Set parameters
+                                            if params:
+                                                if "hidden_layer_sizes" in params:
+                                                    params["hidden_layer_sizes"] = tuple(map(int, params["hidden_layer_sizes"].split(',')))
+                                                model.set_params(**params)
+                                            
+                                            # Train and evaluate model
+                                            results = apply_model(df[feature_cols + [target_col]], model_name, target_column=target_col)
+                                            all_results[model_name] = results
+                                            
+                                            # Store trained model in session state
+                                            st.session_state.trained_models[model_name] = results
+                                            
+                                            if results:
+                                                st.markdown(f"#### {model_name} Results")
+                                                if task_type == "Regression":
+                                                    show_regression_results(model_name, results)
+                                                else:
+                                                    show_classification_results(model_name, results)
+                                        except Exception as e:
+                                            st.error(f"Error training {model_name}: {str(e)}")
+                                    
+                                show_model_comparison(all_results, task_type)
+                        
+                        # Add this inside tab2 (Predictions tab), after the model comparison section:
+                        if selected_models:
+                            st.markdown("### 🎯 Make New Predictions")
+                            st.info("Enter values for features to get predictions from trained models")
+                            
+                            # Create a single form for all inputs
+                            with st.form("prediction_form"):
+                                st.markdown("#### Enter Feature Values")
+                                
+                                # Create input fields without nested columns
+                                input_data = {}
+                                
+                                # Create input fields in a grid-like layout
+                                for feature in feature_cols:
+                                    if df[feature].dtype in ['int64', 'float64']:
+                                        # For numeric features
+                                        mean_val = float(df[feature].mean())
+                                        std_val = float(df[feature].std())
+                                        input_data[feature] = st.number_input(
+                                            f"{feature}",
+                                            value=mean_val,
+                                            format="%.2f",
+                                            help=f"Mean: {mean_val:.2f}, Std: {std_val:.2f}",
+                                            key=f"input_{feature}"
+                                        )
+                                    else:
+                                        # For categorical features
+                                        unique_values = df[feature].unique()
+                                        input_data[feature] = st.selectbox(
+                                            f"{feature}",
+                                            options=unique_values,
+                                            help=f"Unique values: {len(unique_values)}",
+                                            key=f"input_{feature}"
+                                        )
+                                
+                                # Add submit button at the bottom of the form
+                                submit_button = st.form_submit_button(
+                                    "Make Predictions",
+                                    help="Click to get predictions from all selected models"
+                                )
+                            
+                            # Handle form submission
+                            if submit_button:
+                                if not st.session_state.trained_models:
+                                    st.error("Please train the models first before making predictions!")
+                                else:
+                                    st.markdown("### 📊 Prediction Results")
+                                    
+                                    # Create predictions table
+                                    predictions_df = pd.DataFrame(columns=['Model', 'Prediction', 'Confidence/Probability'])
+                                    
+                                    for model_name in selected_models:
+                                        with st.spinner(f"Getting prediction from {model_name}..."):
+                                            try:
+                                                # Get the trained model from session state
+                                                model_results = st.session_state.trained_models.get(model_name)
+                                                if model_results is None:
+                                                    st.warning(f"Model {model_name} has not been trained yet.")
+                                                    continue
+                                                    
+                                                model = model_results['model']
+                                                
+                                                # Prepare input data
+                                                input_df = pd.DataFrame([input_data])
+                                                
+                                                # Apply preprocessing
+                                                processed_input = preprocess_input_data(
+                                                    input_df,
+                                                    handle_missing=handle_missing,
+                                                    missing_strategy=missing_strategy if handle_missing else None,
+                                                    scale_features=scale_features,
+                                                    scaler_type=scaler_type if scale_features else None,
+                                                    encode_categorical=encode_categorical if categorical_cols else False,
+                                                    encoding_method=encoding_method if categorical_cols and encode_categorical else None
+                                                )
+                                                
+                                                # Make prediction
+                                                prediction = model.predict(processed_input)[0]
+                                                
+                                                # Get probability for classification models
+                                                probability = None
+                                                if hasattr(model, 'predict_proba'):
+                                                    probability = model.predict_proba(processed_input)[0].max()
+                                                
+                                                # Add to predictions dataframe
+                                                predictions_df.loc[len(predictions_df)] = [
+                                                    model_name,
+                                                    f"{prediction:.4f}" if isinstance(prediction, (float, np.float64)) else prediction,
+                                                    f"{probability:.4f}" if probability is not None else "N/A"
+                                                ]
+                                            except Exception as e:
+                                                st.error(f"Error making prediction with {model_name}: {str(e)}")
+                                    
+                                    # Display results if we have any predictions
+                                    if not predictions_df.empty:
+                                        show_prediction_results(predictions_df, task_type)
+                
+                # Data Preview tab
+                with tab3:
                     st.markdown("### 🔢 Data Preview")
-                    st.dataframe(df)
+                    display_df = convert_df_for_streamlit(df)
+                    st.dataframe(display_df)
 
 def show_dim_reduction_results(model_type, results, n_components):
     """Display dimensionality reduction results."""
@@ -1059,39 +1699,29 @@ def show_dim_reduction_results(model_type, results, n_components):
             labels={"index": "Number of Components", "y": "Cumulative Explained Variance"},
             template="plotly_dark"
         )
-    if results['embeddings'] is not None:
+        st.plotly_chart(fig_var)
+
+    if 'data' in results:
         if n_components >= 2:
-            # Define column names based on model type
-            if model_type == "t-SNE":
-                x_col, y_col = "TSNE1", "TSNE2"
-            elif model_type == "UMAP":
-                x_col, y_col = "UMAP1", "UMAP2"
-            else:  # PCA
-                x_col, y_col = "PC1", "PC2"
+            # Use the actual column names from the results DataFrame
+            columns = results['data'].columns
             
-            fig_2d = px.scatter(
-                results['data'],
-                x=x_col,
-                y=y_col,
-                title=f"{model_type} 2D Projection",
-                template="plotly_dark"
-            )
-            st.plotly_chart(fig_2d)
+            if len(columns) >= 2:
+                fig_2d = px.scatter(
+                    results['data'],
+                    x=columns[0],  # First component
+                    y=columns[1],  # Second component
+                    title=f"{model_type} 2D Projection",
+                    template="plotly_dark"
+                )
+                st.plotly_chart(fig_2d)
         
-        if n_components >= 3:
-            # Define column names for 3D plot
-            if model_type == "t-SNE":
-                x_col, y_col, z_col = "TSNE1", "TSNE2", "TSNE3"
-            elif model_type == "UMAP":
-                x_col, y_col, z_col = "UMAP1", "UMAP2", "UMAP3"
-            else:  # PCA
-                x_col, y_col, z_col = "PC1", "PC2", "PC3"
-            
+        if n_components >= 3 and len(results['data'].columns) >= 3:
             fig_3d = px.scatter_3d(
                 results['data'],
-                x=x_col,
-                y=y_col,
-                z=z_col,
+                x=results['data'].columns[0],  # First component
+                y=results['data'].columns[1],  # Second component
+                z=results['data'].columns[2],  # Third component
                 title=f"{model_type} 3D Projection",
                 template="plotly_dark"
             )
@@ -1106,24 +1736,72 @@ def show_dim_reduction_results(model_type, results, n_components):
         )
         st.markdown(tmp_download_link, unsafe_allow_html=True)
 
-def show_clustering_results(results):
-    """Display clustering results."""
-    st.markdown("#### Clustering Results")
+def show_clustering_results(results, algorithm_name):
+    """Display clustering results with algorithm-specific visualizations."""
+    st.markdown(f"#### {algorithm_name} Clustering Results")
     
     if 'data' in results and 'Cluster' in results['data'].columns:
-        fig = px.scatter(
-            results['data'],
-            x=results['data'].select_dtypes(include=[np.number]).columns[0],
-            y=results['data'].select_dtypes(include=[np.number]).columns[1],
-            color='Cluster',
-            title="Clustering Results",
-            template="plotly_dark"
-        )
-        st.plotly_chart(fig)
+        # Get numeric columns for visualization
+        numeric_cols = results['data'].select_dtypes(include=[np.number]).columns
+        numeric_cols = [col for col in numeric_cols if col != 'Cluster']
+        
+        if len(numeric_cols) >= 2:
+            # 2D Scatter plot
+            fig_2d = px.scatter(
+                results['data'],
+                x=numeric_cols[0],
+                y=numeric_cols[1],
+                color='Cluster',
+                title=f"{algorithm_name}: 2D Cluster Visualization",
+                template="plotly_dark"
+            )
+            st.plotly_chart(fig_2d)
+            
+            # 3D Scatter plot if we have enough dimensions
+            if len(numeric_cols) >= 3:
+                fig_3d = px.scatter_3d(
+                    results['data'],
+                    x=numeric_cols[0],
+                    y=numeric_cols[1],
+                    z=numeric_cols[2],
+                    color='Cluster',
+                    title=f"{algorithm_name}: 3D Cluster Visualization",
+                    template="plotly_dark"
+                )
+                st.plotly_chart(fig_3d)
         
         # Show cluster distribution
-        st.write("Cluster Distribution:")
-        st.write(results['data']['Cluster'].value_counts())
+        st.write("#### Cluster Distribution")
+        cluster_dist = results['data']['Cluster'].value_counts().sort_index()
+        fig_dist = px.bar(
+            x=cluster_dist.index,
+            y=cluster_dist.values,
+            title="Cluster Size Distribution",
+            labels={'x': 'Cluster', 'y': 'Number of Samples'},
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig_dist)
+        
+        # Algorithm-specific metrics
+        st.write("#### Clustering Metrics")
+        metrics = results.get('metrics', {})
+        
+        st.write(f"Number of clusters: {metrics.get('n_clusters', 'N/A')}")
+        if 'inertia' in metrics:
+            st.write(f"Inertia: {metrics['inertia']:.4f}")
+        
+        # Show parameters used
+        st.write("#### Algorithm Parameters")
+        st.json(metrics.get('params', {}))
+        
+        # Add download button for results
+        if st.button("Download Clustering Results"):
+            tmp_download_link = download_link(
+                results['data'],
+                f"{algorithm_name.lower()}_clustering_results.csv",
+                "Click here to download"
+            )
+            st.markdown(tmp_download_link, unsafe_allow_html=True)
 
 def show_regression_results(model_name, results):
     """Display regression results."""
@@ -1167,6 +1845,320 @@ def show_classification_results(model_name, results):
             template="plotly_dark"
         )
         st.plotly_chart(fig)
+
+# Add this function to show detailed model results
+def show_model_details(model, X_train, X_test, y_train, y_test, task_type, feature_names):
+    """Display detailed model analysis and performance metrics."""
+    st.markdown("### 📊 Model Analysis")
+    
+    # Model Architecture/Parameters
+    st.write("#### Model Configuration")
+    st.code(str(model.get_params()))
+    
+    # Training Results
+    st.write("#### Training Results")
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("Training Set Metrics:")
+        if task_type == "Regression":
+            train_mse = mean_squared_error(y_train, y_train_pred)
+            train_r2 = r2_score(y_train, y_train_pred)
+            st.write(f"- MSE: {train_mse:.4f}")
+            st.write(f"- R² Score: {train_r2:.4f}")
+        else:
+            train_acc = accuracy_score(y_train, y_train_pred)
+            st.write(f"- Accuracy: {train_acc:.4f}")
+            st.write("Classification Report:")
+            st.code(classification_report(y_train, y_train_pred))
+    
+    with col2:
+        st.write("Test Set Metrics:")
+        if task_type == "Regression":
+            test_mse = mean_squared_error(y_test, y_test_pred)
+            test_r2 = r2_score(y_test, y_test_pred)
+            st.write(f"- MSE: {test_mse:.4f}")
+            st.write(f"- R² Score: {test_r2:.4f}")
+        else:
+            test_acc = accuracy_score(y_test, y_test_pred)
+            st.write(f"- Accuracy: {test_acc:.4f}")
+            st.write("Classification Report:")
+            st.code(classification_report(y_test, y_test_pred))
+    
+    # Feature Importance
+    if hasattr(model, 'feature_importances_'):
+        st.write("#### Feature Importance")
+        importance_df = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': model.feature_importances_
+        }).sort_values('Importance', ascending=False)
+        
+        fig = px.bar(
+            importance_df,
+            x='Feature',
+            y='Importance',
+            title="Feature Importance",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig)
+
+def show_model_comparison(all_results, task_type):
+    """Display comparison of model performances."""
+    st.markdown("### 📊 Model Performance Comparison")
+    
+    metrics_df = pd.DataFrame()
+    for model_name, results in all_results.items():
+        metrics = results.get('metrics', {})
+        if task_type == "Regression":
+            metrics_df.loc[model_name, 'R² Score'] = metrics.get('r2', 0)
+            metrics_df.loc[model_name, 'MSE'] = metrics.get('mse', 0)
+        else:
+            metrics_df.loc[model_name, 'Accuracy'] = metrics.get('accuracy', 0)
+    
+    # Create comparison plots
+    if task_type == "Regression":
+        fig_r2 = px.bar(
+            metrics_df.reset_index(),
+            x='index',
+            y='R² Score',
+            title="R² Score Comparison",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig_r2)
+        
+        fig_mse = px.bar(
+            metrics_df.reset_index(),
+            x='index',
+            y='MSE',
+            title="Mean Squared Error Comparison",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig_mse)
+    else:
+        fig_acc = px.bar(
+            metrics_df.reset_index(),
+            x='index',
+            y='Accuracy',
+            title="Accuracy Comparison",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig_acc)
+    
+    # Show metrics table
+    st.write("#### Detailed Metrics")
+    st.dataframe(metrics_df.style.highlight_max(axis=0))
+
+def show_prediction_results(predictions_df, task_type):
+    """Display prediction results with improved styling and visibility."""
+    # Custom CSS for better visibility
+    st.markdown("""
+    <style>
+    .prediction-container {
+        background-color: rgba(26, 35, 51, 0.9);
+        padding: 1.5rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .prediction-header {
+        color: #5663F7;
+        font-size: 1.2rem;
+        font-weight: 600;
+        margin-bottom: 1rem;
+        font-family: 'Poppins', sans-serif;
+    }
+    .prediction-table {
+        width: 100%;
+        color: white !important;
+    }
+    .dataframe {
+        color: white !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Display predictions in styled container
+    st.markdown('<div class="prediction-container">', unsafe_allow_html=True)
+    st.markdown('<p class="prediction-header">Model Predictions</p>', unsafe_allow_html=True)
+    
+    # Convert numeric values to formatted strings
+    formatted_df = predictions_df.copy()
+    
+    # Modified prediction formatting to handle both numerical and categorical values
+    def format_prediction(x):
+        if x == 'N/A':
+            return x
+        try:
+            return f"{float(x):.4f}"
+        except (ValueError, TypeError):
+            return str(x)
+    
+    formatted_df['Prediction'] = formatted_df['Prediction'].apply(format_prediction)
+    
+    # Format confidence/probability values
+    def format_confidence(x):
+        if x == 'N/A':
+            return x
+        try:
+            return f"{float(x):.4f}"
+        except (ValueError, TypeError):
+            return str(x)
+    
+    formatted_df['Confidence/Probability'] = formatted_df['Confidence/Probability'].apply(format_confidence)
+    
+    # Display the table with custom styling
+    st.dataframe(
+        formatted_df.style
+        .set_properties(**{
+            'background-color': 'rgba(70, 73, 80, 0.2)',
+            'color': 'white',
+            'border': '1px solid rgba(255, 255, 255, 0.1)'
+        })
+        .highlight_max(
+            subset=['Confidence/Probability'],
+            props='color: #5663F7; font-weight: bold;'
+        )
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Show visualization of predictions
+    if task_type == "Classification":
+        fig = px.bar(
+            predictions_df,
+            x='Model',
+            y='Confidence/Probability',
+            title="Model Predictions Confidence",
+            template="plotly_dark",
+            color_discrete_sequence=['#5663F7']
+        )
+    else:
+        # For regression, only create bar plot if predictions are numeric
+        try:
+            numeric_preds = pd.to_numeric(predictions_df['Prediction'])
+            fig = px.bar(
+                predictions_df,
+                x='Model',
+                y='Prediction',
+                title="Model Predictions Comparison",
+                template="plotly_dark",
+                color_discrete_sequence=['#5663F7']
+            )
+        except (ValueError, TypeError):
+            # If predictions are categorical, create a different visualization
+            fig = px.bar(
+                predictions_df,
+                x='Model',
+                y='Confidence/Probability',
+                title="Model Confidence Scores",
+                template="plotly_dark",
+                color_discrete_sequence=['#5663F7']
+            )
+    
+    # Update figure layout for better visibility
+    fig.update_layout(
+        plot_bgcolor='rgba(26, 35, 51, 0.9)',
+        paper_bgcolor='rgba(26, 35, 51, 0.9)',
+        font=dict(color='white'),
+        title=dict(
+            font=dict(size=20, color='white', family='Poppins'),
+            x=0.5
+        ),
+        xaxis=dict(
+            gridcolor='rgba(255, 255, 255, 0.1)',
+            tickfont=dict(color='white')
+        ),
+        yaxis=dict(
+            gridcolor='rgba(255, 255, 255, 0.1)',
+            tickfont=dict(color='white')
+        )
+    )
+    
+    st.plotly_chart(fig)
+
+# Add this function for model evaluation
+def evaluate_model(model, X, y, task_type, cv=5):
+    """Evaluate model using cross-validation."""
+    from sklearn.model_selection import cross_val_score, cross_val_predict
+    
+    if task_type == "Regression":
+        scores = cross_val_score(model, X, y, cv=cv, scoring='r2')
+        predictions = cross_val_predict(model, X, y, cv=cv)
+        mse_scores = -cross_val_score(model, X, y, cv=cv, scoring='neg_mean_squared_error')
+        return {
+            'cv_r2_mean': scores.mean(),
+            'cv_r2_std': scores.std(),
+            'cv_mse_mean': mse_scores.mean(),
+            'cv_mse_std': mse_scores.std(),
+            'predictions': predictions
+        }
+    else:
+        scores = cross_val_score(model, X, y, cv=cv, scoring='accuracy')
+        predictions = cross_val_predict(model, X, y, cv=cv)
+        if hasattr(model, 'predict_proba'):
+            proba_predictions = cross_val_predict(model, X, y, cv=cv, method='predict_proba')
+        else:
+            proba_predictions = None
+        return {
+            'cv_accuracy_mean': scores.mean(),
+            'cv_accuracy_std': scores.std(),
+            'predictions': predictions,
+            'probabilities': proba_predictions
+        }
+
+def analyze_regression_features(X, y, feature_names):
+    """Analyze feature importance and relationships for regression."""
+    try:
+        # Correlation analysis
+        corr_matrix = pd.DataFrame(X, columns=feature_names).corrwith(pd.Series(y))
+        
+        fig = px.bar(
+            x=feature_names,
+            y=corr_matrix.values,
+            title="Feature Correlation with Target",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig)
+        
+        # Feature distribution analysis
+        for feature in feature_names:
+            fig = px.histogram(
+                x=X[:, feature_names.index(feature)],
+                title=f"Distribution of {feature}",
+                template="plotly_dark"
+            )
+            st.plotly_chart(fig)
+            
+    except Exception as e:
+        st.error(f"Error in feature analysis: {str(e)}")
+
+def check_regression_assumptions(model, X, y):
+    """Check basic regression assumptions."""
+    try:
+        y_pred = model.predict(X)
+        residuals = y - y_pred
+        
+        # Normality of residuals
+        fig = px.histogram(
+            x=residuals,
+            title="Distribution of Residuals",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig)
+        
+        # Homoscedasticity
+        fig = px.scatter(
+            x=y_pred,
+            y=np.abs(residuals),
+            title="Residuals Magnitude vs Predicted Values",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig)
+        
+    except Exception as e:
+        st.error(f"Error checking regression assumptions: {str(e)}")
 
 if __name__ == '__main__':
     main()
