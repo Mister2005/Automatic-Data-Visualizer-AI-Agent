@@ -3,13 +3,16 @@ streamlit>=1.31.1
 pandas>=2.2.0
 numpy>=1.26.3
 plotly>=5.18.0
+plotly-express>=0.4.1
 scikit-learn>=1.4.0
 
 # Machine Learning
 tensorflow>=2.15.0
 torch>=2.2.0
 transformers>=4.37.2
-umap-learn>=0.5.5
+
+# Dimensionality Reduction
+umap-learn>=0.5.3
 
 # Visualization
 seaborn>=0.13.2
