@@ -1,41 +1,53 @@
 import streamlit as st
+st.set_page_config(
+    page_title="Dynamic AI Data Visualization Agent", 
+    layout="wide",
+    menu_items={
+        'Get Help': None,
+        'Report a bug': None,
+        'About': None
+    }
+)
+
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import base64
 import io
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
+os.environ['PYTORCH_JIT'] = '0'
+os.environ['STREAMLIT_WATCH_EXCLUDE_PATTERNS'] = 'torch.*'
+
 from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder, LabelEncoder
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.ensemble import (
+    RandomForestRegressor, 
+    RandomForestClassifier,
+    GradientBoostingRegressor,
+    GradientBoostingClassifier,
+    ExtraTreesRegressor,
+    ExtraTreesClassifier,
+    AdaBoostRegressor,
+    AdaBoostClassifier
+)
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
-from sklearn.naive_bayes import GaussianNB
 from sklearn.svm import SVC, SVR
 from sklearn.neural_network import MLPRegressor, MLPClassifier
 from sklearn.manifold import TSNE
 import umap
 from sklearn.cluster import DBSCAN, AgglomerativeClustering, Birch, AffinityPropagation, MeanShift, OPTICS
 from sklearn.mixture import GaussianMixture
-from scipy.cluster.hierarchy import dendrogram
+from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    mean_squared_error, 
-    r2_score,
-    accuracy_score,
-    classification_report
-)
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import os
-os.environ['STREAMLIT_WATCH_EXCLUDE_PATHS'] = 'torch._classes'
-
-# Disable torch warnings
-import warnings
-warnings.filterwarnings('ignore', category=UserWarning, module='torch')
-
-# --- Helper Functions ---
+import xgboost as xgb
+import lightgbm as lgb
 
 def load_data(file):
     """Load CSV data from an uploaded file."""
@@ -159,14 +171,22 @@ def encode_categorical_data(df, method='OneHot'):
     
     return df_encoded
 
+# Add this function before apply_model
+def prepare_data_for_lightgbm(X, y):
+    """Prepare data specifically for LightGBM to avoid warnings."""
+    # Convert data to float32 to reduce memory usage and improve speed
+    X = X.astype('float32')
+    if y is not None:
+        y = y.astype('float32')
+    
+    # Handle infinite values
+    X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+    
+    return X, y
+
 def apply_model(df, model_type, target_column=None, n_clusters=3, n_components=2, **kwargs):
     """Apply selected model to the data."""
     try:
-        if not isinstance(model_type, str):
-            raise ValueError(f"Model type must be a string, got {type(model_type)}")
-        
-        model_type = model_type.strip()  # Remove any whitespace
-        
         if target_column and target_column not in df.columns:
             raise ValueError(f"Target column '{target_column}' not found in dataframe")
         
@@ -175,55 +195,39 @@ def apply_model(df, model_type, target_column=None, n_clusters=3, n_components=2
             X = df.drop(target_column, axis=1)
             y = df[target_column]
             
-            # Convert categorical columns
+            # Determine if regression or classification based on target variable
+            is_regression = True
+            if pd.api.types.is_numeric_dtype(y):
+                unique_values = len(np.unique(y))
+                is_regression = unique_values > 10
+            else:
+                is_regression = False
+            
+            # Convert categorical columns to numeric
             for col in X.select_dtypes(include=['object']):
                 le = LabelEncoder()
                 X[col] = le.fit_transform(X[col])
             
+            # Handle classification target variable - ensure labels start from 0
+            if not is_regression:
+                le = LabelEncoder()
+                # Convert to string first to handle numeric classes
+                y = y.astype(str)
+                y = le.fit_transform(y)
+                label_encoder = le
+            
             # Split data
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             
-            # Define available models based on target type
-            if isinstance(y[0], (int, float)) and len(np.unique(y)) > 10:
-                models = {
-                    "Linear Regression": LinearRegression(),
-                    "Random Forest": RandomForestRegressor(random_state=42),
-                    "Decision Tree": DecisionTreeRegressor(random_state=42),
-                    "Neural Network": MLPRegressor(random_state=42),
-                    "SVR": SVR()
-                }
-            else:
-                models = {
-                    "Logistic Regression": LogisticRegression(random_state=42),
-                    "Random Forest": RandomForestClassifier(random_state=42),
-                    "Decision Tree": DecisionTreeClassifier(random_state=42),
-                    "Neural Network": MLPClassifier(random_state=42),
-                    "SVC": SVC(probability=True, random_state=42)
-                }
-            
             # Initialize model based on type
-            if model_type == "Linear Regression":
-                model = LinearRegression()
-            elif model_type == "Random Forest Regressor":
-                model = RandomForestRegressor(random_state=42)
-            elif model_type == "Decision Tree Regressor":
-                model = DecisionTreeRegressor(random_state=42)
-            elif model_type == "Neural Network Regressor":
-                model = MLPRegressor(random_state=42)
-            elif model_type == "SVR":
-                model = SVR()
-            elif model_type == "Logistic Regression":
-                model = LogisticRegression(random_state=42)
-            elif model_type == "Random Forest Classifier":
-                model = RandomForestClassifier(random_state=42)
-            elif model_type == "Decision Tree Classifier":
-                model = DecisionTreeClassifier(random_state=42)
-            elif model_type == "Neural Network Classifier":
-                model = MLPClassifier(random_state=42)
-            elif model_type == "SVC":
-                model = SVC(probability=True, random_state=42)
+            if is_regression:
+                if "Classifier" in model_type:
+                    raise ValueError(f"Cannot use classifier {model_type} for regression task")
+                model = initialize_regression_model(model_type, X_train)
             else:
-                raise ValueError(f"Unknown model type: {model_type}")
+                if "Regressor" in model_type:
+                    raise ValueError(f"Cannot use regressor {model_type} for classification task")
+                model = initialize_classification_model(model_type)
             
             # Train model
             model.fit(X_train, y_train)
@@ -240,16 +244,22 @@ def apply_model(df, model_type, target_column=None, n_clusters=3, n_components=2
                 'X_train': X_train,
                 'X_test': X_test,
                 'y_train': y_train,
-                'y_test': y_test
+                'y_test': y_test,
+                'label_encoder': label_encoder if not is_regression else None
             }
             
-            if isinstance(model, (LinearRegression, DecisionTreeRegressor, 
-                                RandomForestRegressor, SVR, MLPRegressor)):
+            if is_regression:
                 results['metrics']['mse'] = mean_squared_error(y_test, y_pred)
                 results['metrics']['r2'] = r2_score(y_test, y_pred)
             else:
                 results['metrics']['accuracy'] = accuracy_score(y_test, y_pred)
-                results['metrics']['classification_report'] = classification_report(y_test, y_pred)
+                # Convert predictions back to original labels for classification report
+                y_test_original = label_encoder.inverse_transform(y_test)
+                y_pred_original = label_encoder.inverse_transform(y_pred)
+                results['metrics']['classification_report'] = classification_report(
+                    y_test_original, 
+                    y_pred_original
+                )
             
             # Get feature importance if available
             if hasattr(model, 'feature_importances_'):
@@ -259,51 +269,6 @@ def apply_model(df, model_type, target_column=None, n_clusters=3, n_components=2
                 }).sort_values('Importance', ascending=False)
             
             return results
-            
-        else:  # Unsupervised learning
-            if model_type == "K-means":
-                model = KMeans(n_clusters=n_clusters, random_state=42)
-                clusters = model.fit_predict(df.select_dtypes(include=[np.number]))
-                results = {
-                    'model': model,
-                    'data': df.assign(Cluster=clusters),
-                    'metrics': {
-                        'inertia': model.inertia_,
-                        'n_clusters': n_clusters
-                    }
-                }
-                return results
-            
-            elif model_type in ["PCA", "t-SNE", "UMAP"]:
-                numeric_data = df.select_dtypes(include=[np.number])
-                
-                if model_type == "PCA":
-                    model = PCA(n_components=n_components, random_state=42)
-                    embeddings = model.fit_transform(numeric_data)
-                    explained_var = model.explained_variance_ratio_
-                elif model_type == "t-SNE":
-                    model = TSNE(n_components=n_components, random_state=42)
-                    embeddings = model.fit_transform(numeric_data)
-                    explained_var = None
-                else:  # UMAP
-                    reducer = umap.UMAP(n_components=n_components, random_state=42)
-                    embeddings = reducer.fit_transform(numeric_data)
-                    explained_var = None
-                
-                # Create column names
-                dim_names = [f"{model_type}{i+1}" for i in range(n_components)]
-                reduced_df = pd.DataFrame(embeddings, columns=dim_names, index=df.index)
-                
-                results = {
-                    'model': model,
-                    'embeddings': embeddings,
-                    'explained_variance': explained_var,
-                    'data': reduced_df
-                }
-                return results
-            
-            else:
-                raise ValueError(f"Unknown model type: {model_type}")
             
     except Exception as e:
         st.error(f"Error in model application: {str(e)}")
@@ -447,7 +412,7 @@ def create_bar_plot(df, x_col, y_col, color_by=None, title=None):
         font=dict(family="Roboto, sans-serif", color="white"),
         title=dict(font=dict(size=24, family="Poppins, sans-serif")),
         xaxis=dict(showgrid=True, gridcolor='rgba(211, 211, 211, 0.2)'),
-        yaxis=dict(showgrid=True, gridcolor='rgba(211, 211, 211, 0.2)')
+        yaxis=dict(showgrid=True, gridcolor='rgba(211, 211, 211, .2)')
     )
     return fig
 
@@ -685,21 +650,40 @@ def preprocess_input_data(input_df, handle_missing=False, missing_strategy=None,
 # Add this helper function at the top of the file with other helper functions
 def convert_df_for_streamlit(df):
     """Convert DataFrame to make it compatible with Streamlit's display functions."""
-    # Make a copy to avoid modifying the original DataFrame
-    df_converted = df.copy()
-    
-    # Convert object columns to string
-    for col in df_converted.select_dtypes(['object']).columns:
-        df_converted[col] = df_converted[col].astype(str)
-    
-    # Convert any problematic numeric types
-    for col in df_converted.select_dtypes(['float64', 'int64']).columns:
-        if df_converted[col].isnull().any():
-            df_converted[col] = df_converted[col].astype('float32')
-        else:
-            df_converted[col] = df_converted[col].astype('float32')
-            
-    return df_converted
+    try:
+        # Make a copy to avoid modifying the original DataFrame
+        df_converted = df.copy()
+        
+        # Convert object columns to string
+        for col in df_converted.select_dtypes(['object']).columns:
+            df_converted[col] = df_converted[col].astype(str)
+        
+        # Convert Int64 columns to regular int64
+        for col in df_converted.select_dtypes(['Int64']).columns:
+            df_converted[col] = df_converted[col].astype('int64')
+        
+        # Convert nullable integer columns to float
+        for col in df_converted.select_dtypes(['Int64', 'Float64']).columns:
+            df_converted[col] = df_converted[col].astype('float64')
+        
+        # Convert any problematic numeric types
+        for col in df_converted.select_dtypes(['float64', 'int64']).columns:
+            if df_converted[col].isnull().any():
+                df_converted[col] = df_converted[col].astype('float64')
+            else:
+                df_converted[col] = df_converted[col].astype('float64')
+        
+        # Handle any remaining problematic columns
+        for col in df_converted.columns:
+            if df_converted[col].dtype.name not in ['float64', 'int64', 'bool', 'str']:
+                df_converted[col] = df_converted[col].astype(str)
+        
+        return df_converted
+        
+    except Exception as e:
+        st.error(f"Error converting DataFrame: {str(e)}")
+        # Return original DataFrame if conversion fails
+        return df
 
 def safe_display_dataframe(df, container):
     """Safely display DataFrame in Streamlit with error handling."""
@@ -710,6 +694,14 @@ def safe_display_dataframe(df, container):
         container.error(f"Error displaying data: {str(e)}")
         container.write("Showing raw data instead:")
         container.write(df)
+
+def remove_columns(df, columns_to_remove):
+    """Remove selected columns from the DataFrame permanently."""
+    try:
+        return df.drop(columns=columns_to_remove, inplace=False)
+    except Exception as e:
+        st.error(f"Error removing columns: {str(e)}")
+        return df
 
 # --- Custom Styles ---
 def set_custom_theme():
@@ -823,12 +815,21 @@ def set_custom_theme():
 # --- Streamlit Application ---
 
 def main():
-    st.set_page_config(page_title="Dynamic AI Data Visualization Agent", layout="wide")
+    # Initialize session state only once
+    if 'initialized' not in st.session_state:
+        st.session_state.initialized = True
+        st.session_state.trained_models = {}
+        st.session_state.processed_df = None
+        st.session_state.current_fig = None
+    
+    # Set custom theme
     set_custom_theme()
     
-    # Initialize the session state
+    # Initialize session state for data persistence
     if 'trained_models' not in st.session_state:
         st.session_state.trained_models = {}
+    if 'processed_df' not in st.session_state:
+        st.session_state.processed_df = None
     
     # App header with custom styling
     st.markdown("<h1 style='text-align: center; color: #5663F7; margin-bottom: 0;'>Dynamic AI Data Visualization Agent</h1>", unsafe_allow_html=True)
@@ -845,11 +846,32 @@ def main():
     current_fig = None
     
     if uploaded_file is not None:
-        df = load_data(uploaded_file)
+        # Load data only if it hasn't been processed yet or if it's a new file
+        if st.session_state.processed_df is None:
+            df = load_data(uploaded_file)
+            if df is not None:
+                st.session_state.processed_df = df
+        df = st.session_state.processed_df
+        
         if df is not None:
             with col1:
                 st.markdown("### 🔧 Data Processing Options")
                 
+                # Add Column Removal Box
+                with st.expander("❌ Remove Columns", expanded=False):
+                    columns_to_remove = st.multiselect(
+                        "Select columns to remove",
+                        df.columns,
+                        help="Selected columns will be permanently removed from the dataset"
+                    )
+                    if st.button("Remove Selected Columns"):
+                        if columns_to_remove:
+                            df = remove_columns(df, columns_to_remove)
+                            st.session_state.processed_df = df
+                            st.success(f"Removed {len(columns_to_remove)} columns")
+                        else:
+                            st.warning("Please select at least one column to remove")
+
                 # Data Cleaning Box
                 with st.expander("🧹 Data Cleaning", expanded=False):
                     if st.checkbox("Enable data cleaning"):
@@ -857,6 +879,7 @@ def main():
                         if st.button("Clean Data"):
                             with st.spinner("Cleaning data..."):
                                 df = clean_data(df)
+                                st.session_state.processed_df = df
                                 st.success("Data cleaned successfully!")
 
                 # Missing Values Box
@@ -905,6 +928,7 @@ def main():
                                         # Only numeric columns for Mean/Median/KNN
                                         df_numeric = df[cols_to_impute]
                                         df = impute_data(df, strategy, knn_k=k if strategy == "KNN" else None)
+                                        st.session_state.processed_df = df
                                         st.success("✅ Missing values filled successfully!")
                             else:
                                 st.warning("Please select at least one column to impute")
@@ -929,6 +953,7 @@ def main():
                             if cols_to_scale:
                                 with st.spinner(f"Applying {scale_method}..."):
                                     df = scale_data(df, scale_method.split()[0])
+                                    st.session_state.processed_df = df
                                     st.success("✅ Data scaled successfully!")
                             else:
                                 st.warning("Please select at least one column to scale")
@@ -953,6 +978,7 @@ def main():
                             if cols_to_encode:
                                 with st.spinner(f"Applying {encode_method}..."):
                                     df = encode_categorical_data(df, encode_method.split()[0])
+                                    st.session_state.processed_df = df
                                     st.success("✅ Categorical data encoded successfully!")
                             else:
                                 st.warning("Please select at least one column to encode")
@@ -968,28 +994,103 @@ def main():
                         
                         # Dynamic model options based on category
                         if model_category == "Dimensionality Reduction":
+                            st.write("#### Dimensionality Reduction Settings")
+    
                             dim_model = st.selectbox(
                                 "Choose dimensionality reduction method:",
                                 ["PCA", "t-SNE", "UMAP"]
                             )
                             
-                            n_components = st.slider(
-                                "Number of components", 
-                                min_value=2, 
-                                max_value=min(5, df.shape[1]), 
-                                value=2
-                            )
-                            
-                            if dim_model == "t-SNE":
-                                perplexity = st.slider("Perplexity", 5, 50, 30)
-                            
-                            if st.button(f"Apply {dim_model}"):
-                                with st.spinner(f"Applying {dim_model}..."):
-                                    results = apply_model(df, dim_model, 
-                                                       n_components=n_components,
-                                                       perplexity=perplexity if dim_model == "t-SNE" else None)
-                                    if results:
-                                        show_dim_reduction_results(dim_model, results, n_components)
+                            # Get numeric columns only
+                            numeric_df = df.select_dtypes(include=[np.number])
+                            if numeric_df.empty:
+                                st.error("No numeric columns available for dimensionality reduction!")
+                            else:
+                                n_components = st.slider(
+                                    "Number of components", 
+                                    min_value=2, 
+                                    max_value=min(5, numeric_df.shape[1]), 
+                                    value=2
+                                )
+                                
+                                # Model-specific parameters
+                                params = {}
+                                if dim_model == "t-SNE":
+                                    params['perplexity'] = st.slider("Perplexity", 5, 50, 30)
+                                    params['n_iter'] = st.slider("Number of iterations", 250, 1000, 500)
+                                elif dim_model == "UMAP":
+                                    params['n_neighbors'] = st.slider("Number of neighbors", 2, 100, 15)
+                                    params['min_dist'] = st.slider("Minimum distance", 0.0, 1.0, 0.1)
+                                
+                                if st.button(f"Apply {dim_model}"):
+                                    with st.spinner(f"Applying {dim_model}..."):
+                                        try:
+                                            # Apply dimensionality reduction
+                                            if dim_model == "PCA":
+                                                model = PCA(n_components=n_components)
+                                                transformed_data = model.fit_transform(numeric_df)
+                                                explained_var = model.explained_variance_ratio_
+                                                
+                                                # Create results dictionary
+                                                results = {
+                                                    'data': pd.DataFrame(
+                                                        transformed_data,
+                                                        columns=[f'Component_{i+1}' for i in range(n_components)]
+                                                    ),
+                                                    'explained_variance': explained_var,
+                                                    'model': model
+                                                }
+                                            
+                                            elif dim_model == "t-SNE":
+                                                model = TSNE(
+                                                    n_components=n_components,
+                                                    perplexity=params['perplexity'],
+                                                    n_iter=params['n_iter'],
+                                                    random_state=42
+                                                )
+                                                transformed_data = model.fit_transform(numeric_df)
+                                                
+                                                results = {
+                                                    'data': pd.DataFrame(
+                                                        transformed_data,
+                                                        columns=[f'Component_{i+1}' for i in range(n_components)]
+                                                    ),
+                                                    'model': model
+                                                }
+                                            
+                                            elif dim_model == "UMAP":
+                                                reducer = umap.UMAP(
+                                                    n_components=n_components,
+                                                    n_neighbors=params['n_neighbors'],
+                                                    min_dist=params['min_dist'],
+                                                    random_state=42
+                                                )
+                                                transformed_data = reducer.fit_transform(numeric_df)
+                                                
+                                                results = {
+                                                    'data': pd.DataFrame(
+                                                        transformed_data,
+                                                        columns=[f'Component_{i+1}' for i in range(n_components)]
+                                                    ),
+                                                    'model': reducer
+                                                }
+                                            
+                                            # Display results
+                                            st.success(f"{dim_model} applied successfully!")
+                                            show_dim_reduction_results(dim_model, results, n_components)
+                                            
+                                            # Add download button
+                                            transformed_df = results['data'].copy()
+                                            if st.button("Download Transformed Data"):
+                                                tmp_download_link = download_link(
+                                                    transformed_df,
+                                                    f"{dim_model.lower()}_transformed_data.csv",
+                                                    "Click here to download"
+                                                )
+                                                st.markdown(tmp_download_link, unsafe_allow_html=True)
+                                        
+                                        except Exception as e:
+                                            st.error(f"Error applying {dim_model}: {str(e)}")
 
                         # Update the clustering section in the model selection box
                         elif model_category == "Clustering":
@@ -1125,6 +1226,50 @@ def main():
                                             "kernel": ["rbf", "linear"],
                                             "epsilon": (0.01, 0.5)
                                         }
+                                    },
+                                    "XGBoost Regressor": {
+                                        "model": xgb.XGBRegressor(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 500),
+                                            "max_depth": (3, 10),
+                                            "learning_rate": (0.01, 0.3),
+                                            "subsample": (0.5, 1.0),
+                                            "colsample_bytree": (0.5, 1.0)
+                                        }
+                                    },
+                                    "LightGBM Regressor": {
+                                        "model": lgb.LGBMRegressor(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 500),
+                                            "num_leaves": (20, 100),
+                                            "learning_rate": (0.01, 0.3),
+                                            "feature_fraction": (0.5, 1.0)
+                                        }
+                                    },
+                                    "Gradient Boosting Regressor": {
+                                        "model": GradientBoostingRegressor(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 500),
+                                            "max_depth": (3, 10),
+                                            "learning_rate": (0.01, 0.3),
+                                            "subsample": (0.5, 1.0)
+                                        }
+                                    },
+                                    "Extra Trees Regressor": {
+                                        "model": ExtraTreesRegressor(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 300),
+                                            "max_depth": (3, 15),
+                                            "min_samples_split": (2, 10),
+                                            "min_samples_leaf": (1, 4)
+                                        }
+                                    },
+                                    "AdaBoost Regressor": {
+                                        "model": AdaBoostRegressor(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 300),
+                                            "learning_rate": (0.01, 1.0)
+                                        }
                                     }
                                 }
                                 target_col = st.selectbox(
@@ -1157,6 +1302,55 @@ def main():
                                             "alpha": (0.0001, 0.01),
                                             "learning_rate_init": (0.001, 0.1),
                                             "max_iter": (200, 2000)
+                                        }
+                                    },
+                                    "XGBoost Classifier": {
+                                        "model": xgb.XGBClassifier(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 500),
+                                            "max_depth": (3, 10),
+                                            "learning_rate": (0.01, 0.3),
+                                            "subsample": (0.5, 1.0),
+                                            "colsample_bytree": (0.5, 1.0)
+                                        }
+                                    },
+                                    "LightGBM Classifier": {
+                                        "model": lgb.LGBMClassifier(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 500),
+                                            "num_leaves": (20, 100),
+                                            "learning_rate": (0.01, 0.3),
+                                            "feature_fraction": (0.5, 1.0)
+                                        }
+                                    },
+                                    "Gradient Boosting Classifier": {
+                                        "model": GradientBoostingClassifier(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 500),
+                                            "max_depth": (3, 10),
+                                            "learning_rate": (0.01, 0.3),
+                                            "subsample": (0.5, 1.0)
+                                        }
+                                    },
+                                    "Extra Trees Classifier": {
+                                        "model": ExtraTreesClassifier(random_state=42),
+                                        "params": {
+                                            "n_estimators": (50, 300),
+                                            "max_depth": (3, 15),
+                                            "min_samples_split": (2, 10),
+                                            "min_samples_leaf": (1, 4)
+                                        }
+                                    },
+                                    "AdaBoost Classifier": {
+                                        "model": AdaBoostClassifier(
+                                            estimator=DecisionTreeClassifier(max_depth=10),
+                                            n_estimators=50,
+                                            learning_rate=0.1,
+                                            random_state=42
+                                        ),
+                                        "params": {
+                                            "n_estimators": (50, 300),
+                                            "learning_rate": (0.01, 1.0)
                                         }
                                     }
                                 }
@@ -1225,6 +1419,11 @@ def main():
                                                 show_classification_results(model_name, results)
                                 else:
                                     st.warning("Please select at least one feature column")
+
+                # Add Reset Processing Button
+                if st.button("🔄 Reset Data Processing"):
+                    reset_session_state()
+                    st.rerun()
 
                 # Download processed data
                 if st.button("💾 Download Processed Data", key="dl_data"):
@@ -1473,6 +1672,50 @@ def main():
                                         "kernel": ["rbf", "linear"],
                                         "epsilon": (0.01, 0.5)
                                     }
+                                },
+                                "XGBoost Regressor": {
+                                    "model": xgb.XGBRegressor(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 500),
+                                        "max_depth": (3, 10),
+                                        "learning_rate": (0.01, 0.3),
+                                        "subsample": (0.5, 1.0),
+                                        "colsample_bytree": (0.5, 1.0)
+                                    }
+                                },
+                                "LightGBM Regressor": {
+                                    "model": lgb.LGBMRegressor(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 500),
+                                        "num_leaves": (20, 100),
+                                        "learning_rate": (0.01, 0.3),
+                                        "feature_fraction": (0.5, 1.0)
+                                    }
+                                },
+                                "Gradient Boosting Regressor": {
+                                    "model": GradientBoostingRegressor(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 500),
+                                        "max_depth": (3, 10),
+                                        "learning_rate": (0.01, 0.3),
+                                        "subsample": (0.5, 1.0)
+                                    }
+                                },
+                                "Extra Trees Regressor": {
+                                    "model": ExtraTreesRegressor(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 300),
+                                        "max_depth": (3, 15),
+                                        "min_samples_split": (2, 10),
+                                        "min_samples_leaf": (1, 4)
+                                    }
+                                },
+                                "AdaBoost Regressor": {
+                                    "model": AdaBoostRegressor(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 300),
+                                        "learning_rate": (0.01, 1.0)
+                                    }
                                 }
                             }
                         else:
@@ -1502,6 +1745,55 @@ def main():
                                         "alpha": (0.0001, 0.01),
                                         "learning_rate_init": (0.001, 0.1),
                                         "max_iter": (200, 2000)
+                                    }
+                                },
+                                "XGBoost Classifier": {
+                                    "model": xgb.XGBClassifier(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 500),
+                                        "max_depth": (3, 10),
+                                        "learning_rate": (0.01, 0.3),
+                                        "subsample": (0.5, 1.0),
+                                        "colsample_bytree": (0.5, 1.0)
+                                    }
+                                },
+                                "LightGBM Classifier": {
+                                    "model": lgb.LGBMClassifier(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 500),
+                                        "num_leaves": (20, 100),
+                                        "learning_rate": (0.01, 0.3),
+                                        "feature_fraction": (0.5, 1.0)
+                                    }
+                                },
+                                "Gradient Boosting Classifier": {
+                                    "model": GradientBoostingClassifier(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 500),
+                                        "max_depth": (3, 10),
+                                        "learning_rate": (0.01, 0.3),
+                                        "subsample": (0.5, 1.0)
+                                    }
+                                },
+                                "Extra Trees Classifier": {
+                                    "model": ExtraTreesClassifier(random_state=42),
+                                    "params": {
+                                        "n_estimators": (50, 300),
+                                        "max_depth": (3, 15),
+                                        "min_samples_split": (2, 10),
+                                        "min_samples_leaf": (1, 4)
+                                    }
+                                },
+                                "AdaBoost Classifier": {
+                                    "model": AdaBoostClassifier(
+                                        estimator=DecisionTreeClassifier(max_depth=10),
+                                        n_estimators=50,
+                                        learning_rate=0.1,
+                                        random_state=42
+                                    ),
+                                    "params": {
+                                        "n_estimators": (50, 300),
+                                        "learning_rate": (0.01, 1.0)
                                     }
                                 }
                             }
@@ -1686,55 +1978,84 @@ def main():
 
 def show_dim_reduction_results(model_type, results, n_components):
     """Display dimensionality reduction results."""
-    st.markdown(f"#### {model_type} Results")
+    st.markdown(f"### {model_type} Results")
+    
+    if results is None:
+        st.error("No results to display")
+        return
     
     # Show explained variance for PCA
     if model_type == "PCA" and 'explained_variance' in results:
         exp_var = results['explained_variance']
         cum_exp_var = np.cumsum(exp_var)
         
+        # Create explained variance plot
         fig_var = px.line(
             y=cum_exp_var,
             title="Cumulative Explained Variance Ratio",
             labels={"index": "Number of Components", "y": "Cumulative Explained Variance"},
             template="plotly_dark"
         )
+        fig_var.update_layout(
+            showlegend=False,
+            plot_bgcolor='rgba(20, 24, 35, 0.8)',
+            paper_bgcolor='rgba(20, 24, 35, 0.8)'
+        )
         st.plotly_chart(fig_var)
-
-    if 'data' in results:
-        if n_components >= 2:
-            # Use the actual column names from the results DataFrame
-            columns = results['data'].columns
-            
-            if len(columns) >= 2:
-                fig_2d = px.scatter(
-                    results['data'],
-                    x=columns[0],  # First component
-                    y=columns[1],  # Second component
-                    title=f"{model_type} 2D Projection",
-                    template="plotly_dark"
-                )
-                st.plotly_chart(fig_2d)
         
-        if n_components >= 3 and len(results['data'].columns) >= 3:
+        # Show variance table
+        var_df = pd.DataFrame({
+            'Component': [f'Component_{i+1}' for i in range(len(exp_var))],
+            'Explained Variance Ratio': exp_var,
+            'Cumulative Explained Variance': cum_exp_var
+        })
+        st.write("Explained Variance Details:")
+        st.dataframe(var_df)
+
+    # Show transformed data visualizations
+    if 'data' in results:
+        transformed_data = results['data']
+        
+        # 2D Visualization
+        if n_components >= 2:
+            fig_2d = px.scatter(
+                transformed_data,
+                x='Component_1',
+                y='Component_2',
+                title=f"{model_type} 2D Projection",
+                template="plotly_dark"
+            )
+            fig_2d.update_layout(
+                plot_bgcolor='rgba(20, 24, 35, 0.8)',
+                paper_bgcolor='rgba(20, 24, 35, 0.8)'
+            )
+            st.plotly_chart(fig_2d)
+        
+        # 3D Visualization
+        if n_components >= 3:
             fig_3d = px.scatter_3d(
-                results['data'],
-                x=results['data'].columns[0],  # First component
-                y=results['data'].columns[1],  # Second component
-                z=results['data'].columns[2],  # Third component
+                transformed_data,
+                x='Component_1',
+                y='Component_2',
+                z='Component_3',
                 title=f"{model_type} 3D Projection",
                 template="plotly_dark"
             )
+            fig_3d.update_layout(
+                scene=dict(
+                    bgcolor='rgba(20, 24, 35, 0.8)'
+                ),
+                paper_bgcolor='rgba(20, 24, 35, 0.8)'
+            )
             st.plotly_chart(fig_3d)
-    
-    # Add download button
-    if st.button(f"Download {model_type} Results"):
-        tmp_download_link = download_link(
-            results['data'],
-            f"{model_type.lower()}_results.csv",
-            "Click here to download"
-        )
-        st.markdown(tmp_download_link, unsafe_allow_html=True)
+        
+        # Show transformed data preview
+        st.write("#### Transformed Data Preview")
+        st.dataframe(transformed_data.head())
+        
+        # Show shape information
+        st.write(f"Original data shape: {results['data'].shape}")
+        st.write(f"Transformed data shape: {transformed_data.shape}")
 
 def show_clustering_results(results, algorithm_name):
     """Display clustering results with algorithm-specific visualizations."""
@@ -1846,110 +2167,78 @@ def show_classification_results(model_name, results):
         )
         st.plotly_chart(fig)
 
-# Add this function to show detailed model results
-def show_model_details(model, X_train, X_test, y_train, y_test, task_type, feature_names):
-    """Display detailed model analysis and performance metrics."""
-    st.markdown("### 📊 Model Analysis")
-    
-    # Model Architecture/Parameters
-    st.write("#### Model Configuration")
-    st.code(str(model.get_params()))
-    
-    # Training Results
-    st.write("#### Training Results")
-    y_train_pred = model.predict(X_train)
-    y_test_pred = model.predict(X_test)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write("Training Set Metrics:")
-        if task_type == "Regression":
-            train_mse = mean_squared_error(y_train, y_train_pred)
-            train_r2 = r2_score(y_train, y_train_pred)
-            st.write(f"- MSE: {train_mse:.4f}")
-            st.write(f"- R² Score: {train_r2:.4f}")
-        else:
-            train_acc = accuracy_score(y_train, y_train_pred)
-            st.write(f"- Accuracy: {train_acc:.4f}")
-            st.write("Classification Report:")
-            st.code(classification_report(y_train, y_train_pred))
-    
-    with col2:
-        st.write("Test Set Metrics:")
-        if task_type == "Regression":
-            test_mse = mean_squared_error(y_test, y_test_pred)
-            test_r2 = r2_score(y_test, y_test_pred)
-            st.write(f"- MSE: {test_mse:.4f}")
-            st.write(f"- R² Score: {test_r2:.4f}")
-        else:
-            test_acc = accuracy_score(y_test, y_test_pred)
-            st.write(f"- Accuracy: {test_acc:.4f}")
-            st.write("Classification Report:")
-            st.code(classification_report(y_test, y_test_pred))
-    
-    # Feature Importance
-    if hasattr(model, 'feature_importances_'):
-        st.write("#### Feature Importance")
-        importance_df = pd.DataFrame({
-            'Feature': feature_names,
-            'Importance': model.feature_importances_
-        }).sort_values('Importance', ascending=False)
-        
-        fig = px.bar(
-            importance_df,
-            x='Feature',
-            y='Importance',
-            title="Feature Importance",
-            template="plotly_dark"
-        )
-        st.plotly_chart(fig)
-
 def show_model_comparison(all_results, task_type):
-    """Display comparison of model performances."""
-    st.markdown("### 📊 Model Performance Comparison")
+    if not isinstance(all_results, dict) or not all_results:
+        st.warning("No model results available for comparison.")
+        return
     
+    # Initialize DataFrame for metrics
     metrics_df = pd.DataFrame()
+    
+    # Collect metrics from valid results
     for model_name, results in all_results.items():
-        metrics = results.get('metrics', {})
-        if task_type == "Regression":
-            metrics_df.loc[model_name, 'R² Score'] = metrics.get('r2', 0)
-            metrics_df.loc[model_name, 'MSE'] = metrics.get('mse', 0)
-        else:
-            metrics_df.loc[model_name, 'Accuracy'] = metrics.get('accuracy', 0)
+        try:
+            if results is None:
+                st.warning(f"No results available for {model_name}")
+                continue
+                
+            metrics = results.get('metrics', {})
+            if not metrics:
+                st.warning(f"No metrics available for {model_name}")
+                continue
+                
+            if task_type == "Regression":
+                metrics_df.loc[model_name, 'R² Score'] = metrics.get('r2', 0)
+                metrics_df.loc[model_name, 'MSE'] = metrics.get('mse', 0)
+            else:
+                metrics_df.loc[model_name, 'Accuracy'] = metrics.get('accuracy', 0)
+        except Exception as e:
+            st.error(f"Error processing results for {model_name}: {str(e)}")
+            continue
     
-    # Create comparison plots
-    if task_type == "Regression":
-        fig_r2 = px.bar(
-            metrics_df.reset_index(),
-            x='index',
-            y='R² Score',
-            title="R² Score Comparison",
-            template="plotly_dark"
-        )
-        st.plotly_chart(fig_r2)
+    # Only create visualizations if we have data
+    if metrics_df.empty:
+        st.warning("No valid metrics available for comparison.")
+        return
         
-        fig_mse = px.bar(
-            metrics_df.reset_index(),
-            x='index',
-            y='MSE',
-            title="Mean Squared Error Comparison",
-            template="plotly_dark"
-        )
-        st.plotly_chart(fig_mse)
-    else:
-        fig_acc = px.bar(
-            metrics_df.reset_index(),
-            x='index',
-            y='Accuracy',
-            title="Accuracy Comparison",
-            template="plotly_dark"
-        )
-        st.plotly_chart(fig_acc)
-    
-    # Show metrics table
-    st.write("#### Detailed Metrics")
-    st.dataframe(metrics_df.style.highlight_max(axis=0))
+    # Create comparison plots
+    try:
+        if task_type == "Regression":
+            if 'R² Score' in metrics_df.columns:
+                fig_r2 = px.bar(
+                    metrics_df.reset_index(),
+                    x='index',
+                    y='R² Score',
+                    title="R² Score Comparison",
+                    template="plotly_dark"
+                )
+                st.plotly_chart(fig_r2)
+            
+            if 'MSE' in metrics_df.columns:
+                fig_mse = px.bar(
+                    metrics_df.reset_index(),
+                    x='index',
+                    y='MSE',
+                    title="Mean Squared Error Comparison",
+                    template="plotly_dark"
+                )
+                st.plotly_chart(fig_mse)
+        else:
+            if 'Accuracy' in metrics_df.columns:
+                fig_acc = px.bar(
+                    metrics_df.reset_index(),
+                    x='index',
+                    y='Accuracy',
+                    title="Accuracy Comparison",
+                    template="plotly_dark"
+                )
+                st.plotly_chart(fig_acc)
+        
+        # Show metrics table
+        st.write("#### Detailed Metrics")
+        st.dataframe(metrics_df.style.highlight_max(axis=0))
+    except Exception as e:
+        st.error(f"Error creating visualizations: {str(e)}")
 
 def show_prediction_results(predictions_df, task_type):
     """Display prediction results with improved styling and visibility."""
@@ -2159,6 +2448,179 @@ def check_regression_assumptions(model, X, y):
         
     except Exception as e:
         st.error(f"Error checking regression assumptions: {str(e)}")
+
+def reset_session_state():
+    """Reset all session state variables to their initial values."""
+    st.session_state.processed_df = None
+    st.session_state.trained_models = {}
+    # Add any other session state variables that need to be reset
+
+def initialize_classification_model(model_type):
+    """Initialize classification model with proper parameters."""
+    try:
+        if model_type == "Neural Network Classifier":
+            return MLPClassifier(
+                hidden_layer_sizes=(100, 50),  # Two hidden layers
+                max_iter=1000,
+                activation='relu',
+                solver='adam',
+                alpha=0.0001,
+                learning_rate_init=0.001,
+                random_state=42,
+                early_stopping=True,
+                validation_fraction=0.1,
+                n_iter_no_change=10
+            )
+        elif model_type == "AdaBoost Classifier":
+            return AdaBoostClassifier(
+                estimator=DecisionTreeClassifier(max_depth=10),
+                n_estimators=50,
+                learning_rate=0.1,
+                random_state=42
+            )
+        elif model_type == "Logistic Regression":
+            return LogisticRegression(random_state=42)
+        elif model_type == "Random Forest Classifier":
+            return RandomForestClassifier(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                random_state=42
+            )
+        elif model_type == "XGBoost Classifier":
+            return xgb.XGBClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42,
+                n_jobs=-1
+            )
+        elif model_type == "LightGBM Classifier":
+            return lgb.LGBMClassifier(
+                n_estimators=100,
+                num_leaves=31,
+                learning_rate=0.1,
+                random_state=42,
+                n_jobs=-1,
+                verbose=-1  # Suppress warnings
+            )
+        elif model_type == "Gradient Boosting Classifier":
+            return GradientBoostingClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42
+            )
+        elif model_type == "Extra Trees Classifier":
+            return ExtraTreesClassifier(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                random_state=42
+            )
+        else:
+            st.error(f"Unknown classification model type: {model_type}")
+            return None
+    except Exception as e:
+        st.error(f"Error initializing {model_type}: {str(e)}")
+        return None
+
+def initialize_regression_model(model_type, X_train=None):
+    """Initialize regression model with proper parameters."""
+    try:
+        if model_type == "Linear Regression":
+            return LinearRegression()
+            
+        elif model_type == "Random Forest Regressor":
+            return RandomForestRegressor(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                random_state=42
+            )
+            
+        elif model_type == "Decision Tree Regressor":
+            return DecisionTreeRegressor(
+                max_depth=10,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                random_state=42
+            )
+            
+        elif model_type == "Neural Network Regressor":
+            return MLPRegressor(
+                hidden_layer_sizes=(100, 50),
+                max_iter=1000,
+                activation='relu',
+                solver='adam',
+                learning_rate_init=0.001,
+                random_state=42
+            )
+            
+        elif model_type == "SVR":
+            return SVR(
+                kernel='rbf',
+                C=1.0,
+                epsilon=0.1
+            )
+            
+        elif model_type == "XGBoost Regressor":
+            return xgb.XGBRegressor(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42,
+                n_jobs=-1
+            )
+            
+        elif model_type == "LightGBM Regressor":
+            return lgb.LGBMRegressor(
+                n_estimators=100,
+                num_leaves=31,
+                learning_rate=0.1,
+                min_child_samples=20,
+                min_child_weight=1e-3,
+                random_state=42,
+                n_jobs=-1,
+                verbose=-1,
+                force_row_wise=True
+            )
+            
+        elif model_type == "Gradient Boosting Regressor":
+            return GradientBoostingRegressor(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42
+            )
+            
+        elif model_type == "Extra Trees Regressor":
+            return ExtraTreesRegressor(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                random_state=42
+            )
+            
+        elif model_type == "AdaBoost Regressor":
+            return AdaBoostRegressor(
+                estimator=DecisionTreeRegressor(max_depth=3),
+                n_estimators=50,
+                learning_rate=0.1,
+                random_state=42
+            )
+            
+        else:
+            st.error(f"Unknown regression model type: {model_type}")
+            return None
+            
+    except Exception as e:
+        st.error(f"Error initializing {model_type}: {str(e)}")
+        return None
 
 if __name__ == '__main__':
     main()
