@@ -24,7 +24,16 @@ os.environ['STREAMLIT_WATCH_EXCLUDE_PATTERNS'] = 'torch.*'
 
 from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder, LabelEncoder
-from sklearn.cluster import KMeans
+from sklearn.cluster import (
+    KMeans, 
+    DBSCAN, 
+    AgglomerativeClustering, 
+    Birch, 
+    AffinityPropagation, 
+    MeanShift, 
+    OPTICS
+)
+from sklearn.mixture import GaussianMixture
 from sklearn.decomposition import PCA
 from sklearn.ensemble import (
     RandomForestRegressor, 
@@ -42,8 +51,6 @@ from sklearn.svm import SVC, SVR
 from sklearn.neural_network import MLPRegressor, MLPClassifier
 from sklearn.manifold import TSNE
 import umap
-from sklearn.cluster import DBSCAN, AgglomerativeClustering, Birch, AffinityPropagation, MeanShift, OPTICS
-from sklearn.mixture import GaussianMixture
 from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 import xgboost as xgb
